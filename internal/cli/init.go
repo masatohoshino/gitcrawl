@@ -2,9 +2,11 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -118,22 +120,13 @@ func (a *App) runInit(ctx context.Context, args []string) error {
 	if err := config.Save(a.configPath, cfg); err != nil {
 		return err
 	}
-	if !(cfg.Remote.Enabled() && cfg.Remote.Mode == crawlremote.ModeCloud) {
-		if err := config.EnsureRuntimeDirs(cfg); err != nil {
+	if remoteEndpointValue == "" && portableStoreURL == "" {
+		if err := initializeMissingLocalDatabase(ctx, cfg); err != nil {
 			return err
 		}
-	}
-	if remoteEndpointValue == "" && portableStoreURL == "" {
-		if _, portable, err := portableStoreRoot(ctx, cfg.DBPath); err != nil {
+	} else if !(cfg.Remote.Enabled() && cfg.Remote.Mode == crawlremote.ModeCloud) {
+		if err := config.EnsureRuntimeDirs(cfg); err != nil {
 			return err
-		} else if !portable {
-			st, err := store.Open(ctx, cfg.DBPath)
-			if err != nil {
-				return fmt.Errorf("initialize local database: %w", err)
-			}
-			if err := st.Close(); err != nil {
-				return fmt.Errorf("close initialized local database: %w", err)
-			}
 		}
 	}
 	result := initResult{
@@ -153,6 +146,53 @@ func (a *App) runInit(ctx context.Context, args []string) error {
 		result.RemoteArchive = cfg.Remote.Archive
 	}
 	return a.writeInitOutput(result)
+}
+
+// initializeMissingLocalDatabase creates the local SQLite file when it is
+// absent. An existing file inside a Git worktree is left untouched, as is a
+// missing raw file whose manifest selects a gzip archive. Opening either
+// would migrate or dirty an unmarked portable source.
+func initializeMissingLocalDatabase(ctx context.Context, cfg config.Config) error {
+	preserve, err := preservePortableDatabase(ctx, cfg.DBPath)
+	if err != nil {
+		return err
+	}
+	if preserve {
+		return nil
+	}
+	if err := config.EnsureRuntimeDirs(cfg); err != nil {
+		return err
+	}
+	st, err := store.Open(ctx, cfg.DBPath)
+	if err != nil {
+		return fmt.Errorf("initialize local database: %w", err)
+	}
+	if err := st.Close(); err != nil {
+		return fmt.Errorf("close initialized local database: %w", err)
+	}
+	return nil
+}
+
+func preservePortableDatabase(ctx context.Context, dbPath string) (bool, error) {
+	_, portable, err := portableStoreRoot(ctx, dbPath)
+	if err != nil {
+		return false, err
+	}
+	if !portable {
+		return false, nil
+	}
+	_, err = os.Stat(dbPath)
+	if err == nil {
+		return true, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("inspect local database: %w", err)
+	}
+	_, _, compressed, err := portableSourceArtifact(dbPath)
+	if err != nil {
+		return false, err
+	}
+	return compressed, nil
 }
 
 func (a *App) absoluteInitPath(path string) (string, error) {
